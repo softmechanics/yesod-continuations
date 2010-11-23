@@ -5,7 +5,7 @@
            #-}
 
 import Yesod
-import Continuation
+import Yesod.Continuation
 import Control.Applicative
 import Data.List
 import Data.DateTime

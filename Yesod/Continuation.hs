@@ -4,7 +4,7 @@
            , FlexibleInstances
            , UndecidableInstances
            #-}
-module Continuation where
+module Yesod.Continuation where
 
 import System.UUID.V4
 import Yesod
