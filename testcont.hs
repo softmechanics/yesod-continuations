@@ -23,11 +23,18 @@ mkYesod "Test" [$parseRoutes|
 
 instance Yesod Test where 
   approot _ = ""
+
+  -- continuations and session cookies and expire in 1 minute
   clientSessionDuration _ = 1
+
+  -- reset expiration date for current session's continuation, 
+  -- and prune expired sessions
   onRequest = checkCont
 
 instance YesodContinuations Test where
   getContState = tContState <$> getYesod
+
+  -- clean up expired continuations every 1 request 
   getContPruneInterval = return 1
 
 getRootR :: GHandler Test Test RepHtml
