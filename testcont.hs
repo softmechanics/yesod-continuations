@@ -2,23 +2,22 @@
            , TemplateHaskell
            , MultiParamTypeClasses
            , TypeFamilies
+           , FlexibleInstances
            #-}
 
 import Yesod
-import Yesod.Continuation
+import Yesod.Continuation 
 import Control.Applicative
 import Data.List
 import Data.DateTime
 
-data Test = Test
-  { 
-    -- easiest place to put this for now 
-    tContState :: ContState Test 
-  }
+data Test = Test { tContinuations :: Continuations Test }
+
+type TestContinuations = Continuations Test
 
 mkYesod "Test" [$parseRoutes|
 / RootR GET
-/#ContKey ContR GET
+/cont ContSubR TestContinuations tContinuations
 |]
 
 instance Yesod Test where 
@@ -29,30 +28,24 @@ instance Yesod Test where
 
   -- reset expiration date for current session's continuation, 
   -- and prune expired sessions
-  onRequest = checkCont
+  onRequest = continuationsOnRequest
 
 instance YesodContinuations Test where
-  getContState = tContState <$> getYesod
-
-  -- clean up expired continuations every 1 request 
-  getContPruneInterval = return 1
-
-  getContinuationRoute _ = ContR
+  yesodContinuations = tContinuations 
+instance YesodSubRoute (Continuations Test) Test where
+  fromSubRoute _ _ = ContSubR
 
 getRootR :: GHandler Test Test RepHtml
 getRootR = do
   t <- liftIO $ getCurrentTime
-  addCont $ dateTimeHtml t
-  addCont $ dateTimeJson t
-  keys <- sort <$> contKeys
+  addContinuation $ dateTimeHtml t
+  addContinuation $ dateTimeJson t
+  routes <- continuationRoutes
   defaultLayout $ addHamlet [$hamlet|
-    $forall keys key
-      %a!href=@ContR key@ $key$
+    $forall routes route
+      %a!href=@route@ @route@
       %br
   |]
-
-getContR :: ContKey -> GHandler Test Test ChooseRep
-getContR = contHandler 
 
 dateTimeHtml :: DateTime -> GHandler Test Test RepHtml
 dateTimeHtml gent = defaultLayout $ do
@@ -74,6 +67,6 @@ dateTimeJson gent = do
 
 main :: IO ()
 main = do
-  cont <- newContState
+  cont <- newContinuations 1
   basicHandler 3000 $ Test cont
 

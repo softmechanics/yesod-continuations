@@ -3,18 +3,46 @@
            , FlexibleContexts
            , FlexibleInstances
            , UndecidableInstances
+           , QuasiQuotes
+           , TemplateHaskell
+           , TypeFamilies
            #-}
-module Yesod.Continuation where
+module Yesod.Continuation (
+    -- Types
+    Continuations
+  , YesodContinuations(..)
+    -- Initialize continuations
+  , newContinuations
+    -- Maintenance (run from master site's onRequest handler)
+  , continuationsOnRequest 
+    -- Generic Handlers (work from any subsite)
+  , addContinuation
+  , continuationRoutes
+  ) where
 
 import System.UUID.V4
 import Yesod
+import Yesod.Handler
 import Data.Hashable
-import Data.HashMap as H
+import Data.HashMap (HashMap)
+import qualified Data.HashMap as H
 import Data.DateTime
 import Control.Applicative
 import Control.Concurrent.STM
 import Control.Monad
+import Language.Haskell.TH.Syntax
 
+-- Exported Types
+data Continuations y = Continuations {
+    contTContMap :: TContMap y
+  , contTCounter :: TVar Int
+  , contPruneInterval :: Int
+  }
+
+class (Yesod y, YesodSubRoute (Continuations y) y) => YesodContinuations y where
+  yesodContinuations :: y -> Continuations y
+
+-- Internal Types
 type SessionKey = String
 type ContKey = String
 
@@ -30,55 +58,88 @@ type TContSession y = TVar (ContSession y)
 type ContMap y = HashMap SessionKey (TContSession y)
 type TContMap y = TVar (ContMap y)
 
-data ContState y = ContState {
-    tContMap :: TContMap y
-  , tCounter :: TVar Int
-  }
+type ContHandler y a = GHandler (Continuations y) y a
 
-class Yesod y => YesodContinuations y where
-  getContState :: GHandler s y (ContState y)
+mkYesodSub "Continuations master"
+  [ClassP ''Yesod [VarT $ mkName "master"]
+  ,ClassP ''YesodContinuations [VarT (mkName "master")]
+  ]
+  [$parseRoutes|
+/#ContKey ContR GET
+|]
 
-  -- | number of requests between pruning of expired sessions
-  getContPruneInterval :: GHandler s y Int
-
-  -- | contination route
-  getContinuationRoute :: y -> ContKey -> Route y
-
--- | Initialize ContState
-newContState :: IO (ContState y)
-newContState = do
+-- | Initialize Continuations
+newContinuations :: Int -> IO (Continuations y)
+newContinuations checkInterval = do
   (tcm,tc) <- atomically $ do
     tcm <- newTVar H.empty
     tc <- newTVar 0
     return (tcm,tc)
-  return $ ContState tcm tc
+  return $ Continuations tcm tc checkInterval
 
 -- | init/update expiration date for current session, check if expired sessions should be pruned
--- this should be run during onRequest in Yesod class
-checkCont :: YesodContinuations y => GHandler s y ()
-checkCont = do
-  interval <- getContPruneInterval
-  tcount <- getContCounter
+-- this should be run during master site's onRequest handler in Yesod class
+continuationsOnRequest :: YesodContinuations y => GHandler sub y ()
+continuationsOnRequest = runMasterHandler $ contToMasterHandler $ do
+  cont <- getContinuations
+  let interval = contPruneInterval cont
+      tcount = contTCounter cont
   clean <- liftIO $ atomically $ checkCounter interval tcount
   if clean
      then expireContSessions
      else return ()
 
+-- | Exported Generic Site Handlers
+
 -- | Register a continuation
-addCont :: (YesodContinuations y, HasReps rep) => GHandler y y rep -> GHandler s y (Route y)
-addCont hndl = do
+addContinuation :: (YesodContinuations y, HasReps rep) => GHandler y y rep -> GHandler sub y (Route y)
+addContinuation hndl = contToSubHandler $ addContinuationI hndl
+
+-- | continuation routes registered in current session
+continuationRoutes :: YesodContinuations y => GHandler sub y [Route y]
+continuationRoutes = contToSubHandler $ continuationRoutesI
+
+
+--------------------------------------------------
+-- Internal Handlers
+--------------------------------------------------
+addContinuationI :: (Yesod y, HasReps rep) => GHandler y y rep -> ContHandler y (Route y)
+addContinuationI hndl = do
   tscm <- getSessionContMap 
   key <- liftIO $ genUniqueKey tscm $ toChooseRepHandler hndl
   y <- getYesod
-  return $ getContinuationRoute y key
+  rtm <- getRouteToMaster
+  return $ rtm $ ContR key
 
--- | Run a continuation
-contHandler :: YesodContinuations y => ContKey -> GHandler y y ChooseRep
-contHandler cid = do
+continuationRoutesI :: Yesod y => ContHandler y [Route y]
+continuationRoutesI = do
+  rtm <- getRouteToMaster
+  tscm <- getSessionContMap 
+  keys <- liftIO $ atomically $ do
+    scm <- readTVar tscm
+    return $ H.keys scm
+  return $ map (rtm.ContR) keys
+
+-- | subsite route handler
+getContR :: Yesod y => ContKey -> ContHandler y ChooseRep
+getContR cid = do
   cont <- popCont cid
-  case cont of
+  runMasterHandler $ case cont of
        Just hndl -> hndl
        Nothing   -> notFound
+
+getContinuations :: YesodContinuations y => GHandler s y (Continuations y)
+getContinuations = yesodContinuations <$> getYesod
+
+contToMasterHandler :: YesodContinuations y => ContHandler y a -> GHandler y y a
+contToMasterHandler hndl = do
+  y <- getYesod
+  let cont = yesodContinuations y
+      rtm = fromSubRoute cont y
+  toMasterHandlerMaybe rtm yesodContinuations Nothing hndl
+
+contToSubHandler :: YesodContinuations y => ContHandler y a -> GHandler s y a
+contToSubHandler = runMasterHandler . contToMasterHandler
 
 notExpired :: DateTime -> TContSession y -> STM Bool
 notExpired now s = do
@@ -100,33 +161,33 @@ checkCounter interval tc = do
     return $ v == 0
 
 -- | update session expiration date
-contSessionKeepAlive :: YesodContinuations y => GHandler s y ()
+contSessionKeepAlive :: YesodContinuations y => ContHandler y ()
 contSessionKeepAlive = do
   ka <- clientSessionDuration <$> getYesod
   expire <- addMinutes' ka <$> liftIO getCurrentTime
   texpire <- getContSessionExpire
   liftIO $ atomically $ writeTVar texpire expire
 
-expireContSessions :: YesodContinuations y => GHandler s y ()
+expireContSessions :: YesodContinuations y => ContHandler y ()
 expireContSessions = do
   tcm <- getContMap
   liftIO $ do
     t <- getCurrentTime
     deleted <- atomically $ do 
       cm <- readTVar tcm
-      let sessions = toList cm
+      let sessions = H.toList cm
       sessions' <- filterM (notExpired t . snd) sessions 
-      writeTVar tcm $ fromList sessions'
+      writeTVar tcm $ H.fromList sessions'
       return $ (length sessions) - (length sessions')
     putStrLn $ "deleted " ++ show deleted ++ " continuation sessions" 
 
-getContMap :: YesodContinuations y => GHandler s y (TContMap y)
-getContMap = tContMap <$> getContState
+getContMap :: ContHandler y (TContMap y)
+getContMap = contTContMap <$> getYesodSub
 
-getContCounter :: YesodContinuations y => GHandler s y (TVar Int)
-getContCounter = tCounter <$> getContState
+getContCounter :: YesodContinuations y => ContHandler y (TVar Int)
+getContCounter = contTCounter <$> getYesodSub
 
-deleteSession :: YesodContinuations y => SessionKey -> GHandler s y ()
+deleteSession :: YesodContinuations y => SessionKey -> ContHandler y ()
 deleteSession k = do
   tcm <- getContMap
   liftIO $ atomically $ do
@@ -134,19 +195,19 @@ deleteSession k = do
     let cm' = H.delete k cm
     writeTVar tcm cm'
 
-getContSessionKey :: YesodContinuations y => GHandler s y (Maybe SessionKey)
+getContSessionKey :: ContHandler y (Maybe SessionKey)
 getContSessionKey = lookupSession "ContSession"
 
-putContSessionKey :: YesodContinuations y => SessionKey -> GHandler s y ()
+putContSessionKey :: SessionKey -> ContHandler y ()
 putContSessionKey = setSession "ContSession"
 
-getContSessionExpire :: YesodContinuations y => GHandler s y (TVar DateTime)
+getContSessionExpire :: Yesod y => ContHandler y (TVar DateTime)
 getContSessionExpire = do
   tcs <- getContSession
   cs <- liftIO $ atomically $ readTVar tcs
   return $ csTExpire cs
 
-getContSession :: YesodContinuations y => GHandler s y (TContSession y)
+getContSession :: Yesod y => ContHandler y (TContSession y)
 getContSession = do
   y <- getYesod
   tcm <- getContMap 
@@ -170,7 +231,7 @@ getContSession = do
                 atomically $ writeTVar tcm cm'
                 return cs
 
-getSessionContMap :: YesodContinuations y => GHandler s y (TSessionContMap y)
+getSessionContMap :: Yesod y => ContHandler y (TSessionContMap y)
 getSessionContMap = do
   tcs <- getContSession
   csTSessionContMap <$> (liftIO . atomically $ readTVar tcs)
@@ -186,7 +247,7 @@ genUniqueKey tm v = do
 insertIfNotMember :: (Hashable k, Ord k) => TVar (HashMap k v) -> k -> v -> STM Bool
 insertIfNotMember tm k v = do
   m <- readTVar tm
-  if member k m
+  if H.member k m
      then return False
      else do writeTVar tm $ H.insert k v m
              return True
@@ -196,7 +257,7 @@ toChooseRepHandler hndl = do
   rep <- hndl
   return $ chooseRep rep
 
-popCont :: YesodContinuations y => ContKey -> GHandler s y (Maybe (GHandler y y ChooseRep))
+popCont :: Yesod y => ContKey -> ContHandler y (Maybe (GHandler y y ChooseRep))
 popCont ckey = do
   scm <- getSessionContMap 
   liftIO $ atomically $ do
@@ -205,12 +266,3 @@ popCont ckey = do
         m' = H.delete ckey m
     writeTVar scm m'
     return hndl
-
-contKeys :: YesodContinuations y => GHandler s y [ContKey]
-contKeys = do
-  tscm <- getSessionContMap 
-  liftIO $ atomically $ do
-    scm <- readTVar tscm
-    return $ H.keys scm
-  
-
