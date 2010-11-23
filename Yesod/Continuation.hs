@@ -41,6 +41,9 @@ class Yesod y => YesodContinuations y where
   -- | number of requests between pruning of expired sessions
   getContPruneInterval :: GHandler s y Int
 
+  -- | contination route
+  getContinuationRoute :: y -> ContKey -> Route y
+
 -- | Initialize ContState
 newContState :: IO (ContState y)
 newContState = do
@@ -60,6 +63,22 @@ checkCont = do
   if clean
      then expireContSessions
      else return ()
+
+-- | Register a continuation
+addCont :: (YesodContinuations y, HasReps rep) => GHandler y y rep -> GHandler s y (Route y)
+addCont hndl = do
+  tscm <- getSessionContMap 
+  key <- liftIO $ genUniqueKey tscm $ toChooseRepHandler hndl
+  y <- getYesod
+  return $ getContinuationRoute y key
+
+-- | Run a continuation
+contHandler :: YesodContinuations y => ContKey -> GHandler y y ChooseRep
+contHandler cid = do
+  cont <- popCont cid
+  case cont of
+       Just hndl -> hndl
+       Nothing   -> notFound
 
 notExpired :: DateTime -> TContSession y -> STM Bool
 notExpired now s = do
@@ -177,11 +196,6 @@ toChooseRepHandler hndl = do
   rep <- hndl
   return $ chooseRep rep
 
-addCont :: (YesodContinuations y, HasReps rep) => GHandler y y rep -> GHandler s y ContKey
-addCont hndl = do
-  tscm <- getSessionContMap 
-  liftIO $ genUniqueKey tscm $ toChooseRepHandler hndl
-
 popCont :: YesodContinuations y => ContKey -> GHandler s y (Maybe (GHandler y y ChooseRep))
 popCont ckey = do
   scm <- getSessionContMap 
@@ -191,13 +205,6 @@ popCont ckey = do
         m' = H.delete ckey m
     writeTVar scm m'
     return hndl
-
-contHandler :: YesodContinuations y => ContKey -> GHandler y y ChooseRep
-contHandler cid = do
-  cont <- popCont cid
-  case cont of
-       Just hndl -> hndl
-       Nothing   -> notFound
 
 contKeys :: YesodContinuations y => GHandler s y [ContKey]
 contKeys = do

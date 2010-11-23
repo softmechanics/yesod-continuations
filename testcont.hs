@@ -37,6 +37,8 @@ instance YesodContinuations Test where
   -- clean up expired continuations every 1 request 
   getContPruneInterval = return 1
 
+  getContinuationRoute _ = ContR
+
 getRootR :: GHandler Test Test RepHtml
 getRootR = do
   t <- liftIO $ getCurrentTime
