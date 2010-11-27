@@ -27,6 +27,7 @@ import Data.Hashable
 import Data.HashMap (HashMap)
 import qualified Data.HashMap as H
 import Data.DateTime
+import Data.Maybe (fromMaybe)
 import Control.Applicative
 import Control.Concurrent.STM
 import Control.Monad
@@ -85,9 +86,7 @@ continuationsOnRequest = runMasterHandler $ contToMasterHandler $ do
   let interval = contPruneInterval cont
       tcount = contTCounter cont
   clean <- liftIO $ atomically $ checkCounter interval tcount
-  if clean
-     then expireContSessions
-     else return ()
+  when clean expireContSessions
 
 -- | Exported Generic Site Handlers
 
@@ -97,7 +96,7 @@ addContinuation hndl = contToSubHandler $ addContinuationI hndl
 
 -- | continuation routes registered in current session
 continuationRoutes :: YesodContinuations y => GHandler sub y [Route y]
-continuationRoutes = contToSubHandler $ continuationRoutesI
+continuationRoutes = contToSubHandler continuationRoutesI
 
 
 --------------------------------------------------
@@ -124,9 +123,7 @@ continuationRoutesI = do
 getContR :: Yesod y => ContKey -> ContHandler y ChooseRep
 getContR cid = do
   cont <- popCont cid
-  runMasterHandler $ case cont of
-       Just hndl -> hndl
-       Nothing   -> notFound
+  runMasterHandler $ fromMaybe notFound cont 
 
 getContinuations :: YesodContinuations y => GHandler s y (Continuations y)
 getContinuations = yesodContinuations <$> getYesod
@@ -178,7 +175,7 @@ expireContSessions = do
       let sessions = H.toList cm
       sessions' <- filterM (notExpired t . snd) sessions 
       writeTVar tcm $ H.fromList sessions'
-      return $ (length sessions) - (length sessions')
+      return $ length sessions - length sessions'
     putStrLn $ "deleted " ++ show deleted ++ " continuation sessions" 
 
 getContMap :: ContHandler y (TContMap y)
@@ -266,3 +263,8 @@ popCont ckey = do
         m' = H.delete ckey m
     writeTVar scm m'
     return hndl
+
+-- | convert a master site handler to a subsite handler
+runMasterHandler :: GHandler master master a -> GHandler sub master a
+runMasterHandler = toMasterHandlerMaybe id id Nothing 
+

@@ -1,5 +1,4 @@
 {-# LANGUAGE QuasiQuotes
-           , TemplateHaskell
            , MultiParamTypeClasses
            , TypeFamilies
            , FlexibleInstances
@@ -37,7 +36,7 @@ instance YesodSubRoute (Continuations Test) Test where
 
 getRootR :: GHandler Test Test RepHtml
 getRootR = do
-  t <- liftIO $ getCurrentTime
+  t <- liftIO getCurrentTime
   addContinuation $ dateTimeHtml t
   addContinuation $ dateTimeJson t
   routes <- continuationRoutes
